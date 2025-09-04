@@ -1,0 +1,580 @@
+import os
+import re
+import threading
+from collections import defaultdict
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定默认字体
+plt.rcParams['axes.unicode_minus'] = False  # 解决保存图像是负号'-'显示为方块的问题
+import networkx as nx
+import numpy as np
+import pandas as pd
+from docx import Document as DocxReader
+from docx import Document as DocxWriter
+from docx.shared import Pt, Inches
+from docx.oxml.ns import qn
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from pdfminer.high_level import extract_text as extract_text_from_pdf
+
+
+# ------------------- 文本處理 -------------------
+# 提取不同类型文件的文本内容
+def extract_text_from_file(file_path):
+    """
+    根据文件类型（.txt/.docx/.pdf）读取文本内容。
+    - txt: 用utf-8读取
+    - docx: 用python-docx读取段落并合并
+    - pdf: 用pdfminer.high_level.extract_text提取文本
+    - 其他: 返回空字符串
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == '.txt':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        elif ext == '.docx':
+            from docx import Document
+            doc = Document(file_path)
+            return '\n'.join([para.text for para in doc.paragraphs])
+        elif ext == '.pdf':
+            from pdfminer.high_level import extract_text as pdf_extract_text
+            return pdf_extract_text(file_path)
+        else:
+            return ""
+    except Exception as e:
+        return ""
+
+
+# ----------- Word文檔token提取與n-gram生成 -----------
+
+def extract_paragraph_tokens(file_path):
+    """
+    提取Word文档每个段落的token列表，支持新实体标记形式 [实体]。
+    - 每个段落为一个token序列（列表）。
+    - 若run.bold且run.underline且run.text以[开头且以]结尾，则去除中括号整体作为实体token。
+    - 若run.bold且run.underline但不满足中括号，仍视为整体token。
+    - 其他字符按单字分词。
+    返回：List[List[str]]，每个元素为该段落的token列表。
+    """
+    doc = DocxReader(file_path)
+    all_paragraph_tokens = []
+    for para in doc.paragraphs:
+        tokens = []
+        for run in para.runs:
+            if run.bold and run.underline and run.text and run.text.startswith('[') and run.text.endswith(']'):
+                # 新实体标记 [实体]
+                entity = run.text[1:-1]
+                if entity:
+                    tokens.append(entity)
+            elif run.bold and run.underline and run.text:
+                # 兼容旧实体整体
+                tokens.append(run.text)
+            else:
+                # 非实体，逐字分词
+                tokens.extend([ch for ch in run.text])
+        all_paragraph_tokens.append(tokens)
+    return all_paragraph_tokens
+
+def generate_paragraph_ngrams(file_path, n):
+    """
+    基于extract_paragraph_tokens，生成段落内滑动的n-gram tokens。
+    - 返回所有段落的n-gram合并后的列表。
+    - 实体token直接参与合并（不含中括号），非实体为单字。
+    """
+    para_tokens_list = extract_paragraph_tokens(file_path)
+    ngram_tokens = []
+    for tokens in para_tokens_list:
+        if len(tokens) < n:
+            continue
+        ngrams = [''.join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+        ngram_tokens.extend(ngrams)
+    return ngram_tokens
+
+
+# ------------------- 相似度計算 -------------------
+def compute_similarity(file_paths, n):
+    # 使用 generate_paragraph_ngrams 提取 ngram tokens
+    all_ngram_tokens = [generate_paragraph_ngrams(p, n) for p in file_paths]
+    texts_for_vectorizer = [' '.join(tokens) for tokens in all_ngram_tokens]
+    vectorizer = CountVectorizer(tokenizer=lambda x: x.split(), lowercase=False)
+    X = vectorizer.fit_transform(texts_for_vectorizer)
+    feature_names = vectorizer.get_feature_names_out()
+    doc_vectors = X.toarray()
+    sim = cosine_similarity(doc_vectors)
+    return sim, feature_names, doc_vectors, vectorizer
+
+# ------------------- 矩陣熱力圖 -------------------
+def plot_heatmap(sim_matrix, doc_names, outpath, title=None):
+    plt.figure(figsize=(16,9))
+    masked_matrix = sim_matrix.copy()
+    np.fill_diagonal(masked_matrix, 1.0)
+
+    # 設置支持中文的字體，優先加載 simhei.ttf、simkai.ttf、simsun.ttf，從固定目錄
+    import matplotlib
+    import matplotlib.font_manager as fm
+    font_found = None
+    font_path = None
+    # 固定字體目錄
+    ttf_dir = '/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/matplotlib/mpl-data/fonts/ttf'
+    ttf_candidates = ['simhei.ttf', 'simkai.ttf', 'simsun.ttf']
+    for fname in ttf_candidates:
+        fpath = os.path.join(ttf_dir, fname)
+        if os.path.isfile(fpath):
+            font_path = fpath
+            break
+    if font_path:
+        font_prop = fm.FontProperties(fname=font_path)
+        font_found = font_prop.get_name()
+        # 設置全局默認字體
+        matplotlib.rcParams['axes.unicode_minus'] = False
+        matplotlib.rcParams['font.sans-serif'] = [font_found]
+        matplotlib.rcParams['font.family'] = 'sans-serif'
+        plt.rcParams['font.sans-serif'] = [font_found]
+        plt.rcParams['font.family'] = 'sans-serif'
+    else:
+        # 沒有找到，保持原來的設置
+        matplotlib.rcParams['axes.unicode_minus'] = False
+        font_prop = None
+
+    # 紅白色對比色階: 0為白色，1為紅色
+    from matplotlib.colors import LinearSegmentedColormap
+    reds_white = LinearSegmentedColormap.from_list('reds_white', ['#ffffff', '#ff0000'])
+    cmap = reds_white
+
+    im = plt.imshow(masked_matrix, interpolation='nearest', aspect='auto', cmap=cmap, vmin=0, vmax=1)
+
+    # 處理标签: 去除数字字符
+    labels = [re.sub(r'\d+', '', os.path.splitext(name)[0]) for name in doc_names]
+    # X轴竖排显示（从上至下）
+    def vertical_label(label):
+        # 将字符串每个字符用换行分隔
+        return '\n'.join(label)
+    xlabels = [vertical_label(label) for label in labels]
+    if font_prop:
+        xtick_objs = plt.xticks(range(len(doc_names)), xlabels, rotation=0, fontproperties=font_prop, va='top')
+        plt.yticks(range(len(doc_names)), labels, fontproperties=font_prop)
+    else:
+        xtick_objs = plt.xticks(range(len(doc_names)), xlabels, rotation=0, va='top')
+        plt.yticks(range(len(doc_names)), labels)
+
+    # 竖排X轴标签首字符紧贴x轴线，通过set_y或set_position调整
+    ax = plt.gca()
+    for tick in ax.get_xticklabels():
+        # 获取当前位置
+        x, y = tick.get_position()
+        # 默认y=0，向上偏移一点。我们要让首字符更靠近x轴，适当上移
+        tick.set_y(0)
+
+    ax = plt.gca()
+    # 對角線顏色設為正紅色
+    for i in range(masked_matrix.shape[0]):
+        ax.add_patch(
+            plt.Rectangle((i-0.5, i-0.5), 1, 1, fill=True, color=(1,0,0), linewidth=0)
+        )
+
+    # 顯示格子內數值（保留三位小數，顯示為數值，不帶百分號）
+    for i in range(masked_matrix.shape[0]):
+        for j in range(masked_matrix.shape[1]):
+            val = masked_matrix[i, j]
+            color = 'black'
+            if i == j:
+                color = 'white'
+            # 以百分比顯示，保留两位小數，不帶百分號
+            txt = f"{val*100:.2f}"
+            if font_prop:
+                plt.text(
+                    j, i, txt, ha='center', va='center',
+                    color=color,
+                    fontsize=11,
+                    fontproperties=font_prop
+                )
+            else:
+                plt.text(
+                    j, i, txt, ha='center', va='center',
+                    color=color,
+                    fontsize=8
+                )
+    # 移除額外的右側大標註，只保留 colorbar 的百分號顯示
+
+    if title is None:
+        title = '圖1《論語》《史記》《家語》《衣鏡》餘弦相似度矩陣'
+    if font_prop:
+        plt.title(title, fontproperties=font_prop, fontsize=18)
+    else:
+        plt.title(title, fontsize=18)
+    cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+    # colorbar 百分比顯示，右側顯示百分號
+    if font_prop:
+        cbar.set_label("相似度 (%)", fontproperties=font_prop)
+    else:
+        cbar.set_label("相似度 (%)")
+    cbar.ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x*100:.0f}%"))
+    if font_prop:
+        for t in cbar.ax.get_yticklabels():
+            t.set_fontproperties(font_prop)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=600)
+    plt.close()
+
+
+# ------------------- 報告生成 -------------------
+def generate_report(out_docx_path, doc_names, feature_names, doc_vectors, sim_matrix,
+                    top_ngrams_info, heatmap_path, doc_texts, file_paths):
+    doc = DocxWriter()
+    doc.add_heading('N-gram Similarity Report', level=1)
+
+    # 新章节: Pairwise Similarity Weights (移到最前面)
+    doc.add_heading('Pairwise Similarity Weights', level=2)
+    for i in range(len(doc_names)):
+        for j in range(i+1, len(doc_names)):
+            # 文档名称去除扩展名和数字字符
+            doc1 = re.sub(r'\d+', '', os.path.splitext(doc_names[i])[0])
+            doc2 = re.sub(r'\d+', '', os.path.splitext(doc_names[j])[0])
+            weight = sim_matrix[i, j]
+            doc.add_paragraph(f"{doc1} -- {doc2} [weight={weight:.4f}]")
+
+    doc.add_paragraph('Documents analyzed: ' + ', '.join([
+        re.sub(r'\d+', '', os.path.splitext(n)[0]) for n in doc_names
+    ]))
+
+    # 分詞結果（單字符和实体整体）: 展示完整N-gram列表（实体整体显示），Word正文样式，宋体5号，段落间距0
+    doc.add_heading('Word Tokenization', level=2)
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    # 定义样式
+    style_name = 'TokenParagraph'
+    if style_name not in doc.styles:
+        style = doc.styles.add_style(style_name, 1)  # 1=paragraph style
+        font = style.font
+        font.name = u'宋体'
+        font.size = Pt(10.5)
+        # 强制设置 eastAsia 字体
+        rFonts = font.element.rPr.rFonts
+        rFonts.set(qn('w:eastAsia'), u'宋体')
+        pformat = style.paragraph_format
+        pformat.space_before = Pt(0)
+        pformat.space_after = Pt(0)
+    else:
+        style = doc.styles[style_name]
+    # 展示完整 N-gram 列表
+    for name, text, full_path in zip(doc_names, doc_texts, file_paths):
+        base_name = re.sub(r'\d+', '', os.path.splitext(name)[0])
+        tokens = []
+        if full_path.lower().endswith('.docx'):
+            para_tokens = extract_paragraph_tokens(full_path)
+            tokens = [tok for para in para_tokens for tok in para]
+        else:
+            tokens = list(text)
+        para = doc.add_paragraph(f"{base_name}: " + ' | '.join(tokens), style=style_name)
+        # 强制再设为宋体5号，段间距0
+        if para.runs:
+            run = para.runs[0]
+            run.font.name = u'宋体'
+            run.font.size = Pt(10.5)
+            rFonts = run._element.rPr.rFonts
+            rFonts.set(qn('w:eastAsia'), u'宋体')
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after = Pt(0)
+
+    # 熱力圖
+    doc.add_heading('Similarity Matrix', level=2)
+    doc.add_picture(heatmap_path, width=Inches(6))
+
+    # Top N-grams
+    doc.add_heading('Top N-grams', level=2)
+    table = doc.add_table(rows=1, cols=3)
+    hdr = table.rows[0].cells
+    hdr[0].text = 'Rank'
+    hdr[1].text = 'N-gram'
+    hdr[2].text = 'Frequency'
+    # 设置表头字体样式
+    for cell in hdr:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.name = u'宋体'
+                run.font.size = Pt(10.5)
+                rFonts = run._element.rPr.rFonts
+                rFonts.set(qn('w:eastAsia'), u'宋体')
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+    for rank, info in enumerate(top_ngrams_info, start=1):
+        row = table.add_row().cells
+        row[0].text = str(rank)
+        row[1].text = info['ngram']
+        row[2].text = str(info['freq'])
+        for cell in row:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = u'宋体'
+                    run.font.size = Pt(10.5)
+                    rFonts = run._element.rPr.rFonts
+                    rFonts.set(qn('w:eastAsia'), u'宋体')
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+
+    # N-gram Vectors
+    doc.add_heading('N-gram Vectors', level=2)
+    table2 = doc.add_table(rows=1, cols=1+len(doc_names))
+    hdr = table2.rows[0].cells
+    hdr[0].text = 'N-gram \\ Document'
+    for i, name in enumerate(doc_names):
+        # 文档名称去除扩展名和数字字符
+        base_name = re.sub(r'\d+', '', os.path.splitext(name)[0])
+        hdr[i+1].text = base_name
+    # 设置表头字体样式
+    for cell in hdr:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.name = u'宋体'
+                run.font.size = Pt(10.5)
+                rFonts = run._element.rPr.rFonts
+                rFonts.set(qn('w:eastAsia'), u'宋体')
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+    for info in top_ngrams_info:
+        row = table2.add_row().cells
+        row[0].text = info['ngram']
+        for i, name in enumerate(doc_names):
+            row[i+1].text = str(info['doc_vector_values'].get(name, 0))
+        for cell in row:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = u'宋体'
+                    run.font.size = Pt(10.5)
+                    rFonts = run._element.rPr.rFonts
+                    rFonts.set(qn('w:eastAsia'), u'宋体')
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+
+    # 新部分: Top-10 N-grams Between Pairs of Documents
+    doc.add_heading('Top-10 N-grams Between Pairs of Documents', level=2)
+    # 计算每对文档的top-10 n-grams
+    from itertools import combinations
+    table3 = doc.add_table(rows=1, cols=3)
+    hdr3 = table3.rows[0].cells
+    hdr3[0].text = 'Document Pair'
+    hdr3[1].text = 'Top-10 N-grams'
+    hdr3[2].text = 'Counts (doc1, doc2)'
+    # 设置表头字体样式
+    for cell in hdr3:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.name = u'宋体'
+                run.font.size = Pt(10.5)
+                rFonts = run._element.rPr.rFonts
+                rFonts.set(qn('w:eastAsia'), u'宋体')
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+    # 构建一个 ngram -> index 的映射
+    ngram2idx = {str(ng): i for i, ng in enumerate(feature_names)}
+    for idx1, idx2 in combinations(range(len(doc_names)), 2):
+        # 文档名称去除扩展名和数字字符
+        name1 = re.sub(r'\d+', '', os.path.splitext(doc_names[idx1])[0])
+        name2 = re.sub(r'\d+', '', os.path.splitext(doc_names[idx2])[0])
+        vec1 = doc_vectors[idx1]
+        vec2 = doc_vectors[idx2]
+        # 共同出现的 n-gram 及其总频率
+        common_idxs = np.where((vec1 > 0) & (vec2 > 0))[0]
+        if len(common_idxs) == 0:
+            continue
+        # 按两个文档的 ngram 频率之和排序
+        common_ngrams = []
+        for idx in common_idxs:
+            ng = feature_names[idx]
+            freq_sum = vec1[idx] + vec2[idx]
+            common_ngrams.append((ng, freq_sum, vec1[idx], vec2[idx]))
+        # 排序取前10
+        top_common = sorted(common_ngrams, key=lambda x: x[1], reverse=True)[:10]
+        ngram_strs = [f"{ng}" for ng,_,_,_ in top_common]
+        counts_strs = [f"{a},{b}" for _,__,a,b in top_common]
+        row = table3.add_row().cells
+        row[0].text = f"{name1} & {name2}"
+        row[1].text = ', '.join(ngram_strs)
+        row[2].text = '; '.join(counts_strs)
+        for cell in row:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.name = u'宋体'
+                    run.font.size = Pt(10.5)
+                    rFonts = run._element.rPr.rFonts
+                    rFonts.set(qn('w:eastAsia'), u'宋体')
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+
+    doc.save(out_docx_path)
+
+# ------------------- GUI -------------------
+class NgramApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Single-character N-gram Similarity Tool")
+        master.geometry("950x700")
+
+        self.filepaths = []
+        self.doc_texts = []
+        self.doc_names = []
+
+        self.n_var = tk.IntVar(value=3)
+        self.topk_edge_var = tk.IntVar(value=10)
+        self.topk_ngram_var = tk.IntVar(value=10)
+        self.show_examples_var = tk.BooleanVar(value=True)  # 控制是否在報告中顯示句子
+        self.heatmap_title_var = tk.StringVar(value='圖1《論語》《史記》《家語》《衣鏡》餘弦相似度矩陣')
+
+        frame = ttk.Frame(master)
+        frame.pack(fill='both', expand=True, padx=8, pady=8)
+
+        # 文件列表
+        file_frame = ttk.LabelFrame(frame, text="Files")
+        file_frame.pack(fill='x', padx=4, pady=4)
+        ttk.Button(file_frame, text="Add files", command=self.add_files).pack(side='left')
+        ttk.Button(file_frame, text="Clear", command=self.clear_files).pack(side='left', padx=6)
+        self.files_listbox = tk.Listbox(file_frame, height=4)
+        self.files_listbox.pack(fill='x', padx=6, pady=6)
+
+        # 參數
+        param_frame = ttk.LabelFrame(frame, text="Parameters")
+        param_frame.pack(fill='x', padx=4, pady=4)
+        ttk.Label(param_frame, text="n (n-grams):").pack(side='left', padx=6)
+        ttk.Entry(param_frame, width=6, textvariable=self.n_var).pack(side='left')
+        ttk.Label(param_frame, text="Top-K edges:").pack(side='left', padx=6)
+        ttk.Entry(param_frame, width=6, textvariable=self.topk_edge_var).pack(side='left')
+        ttk.Label(param_frame, text="Top-K N-grams:").pack(side='left', padx=6)
+        ttk.Entry(param_frame, width=6, textvariable=self.topk_ngram_var).pack(side='left')
+        ttk.Checkbutton(param_frame, text="Show example sentences", variable=self.show_examples_var).pack(side='left', padx=6)
+        ttk.Label(param_frame, text="Heatmap Title:").pack(side='left', padx=6)
+        ttk.Entry(param_frame, width=50, textvariable=self.heatmap_title_var).pack(side='left')
+        ttk.Button(param_frame, text="Show Top-K", command=self.show_topk_ngrams).pack(side='left', padx=6)
+
+        # 操作按鈕
+        action_frame = ttk.Frame(frame)
+        action_frame.pack(fill='x', padx=4, pady=4)
+        ttk.Button(action_frame, text="Run", command=self.run_analysis_thread).pack(side='left')
+        ttk.Button(action_frame, text="Export CSV", command=self.export_csv).pack(side='left', padx=6)
+        ttk.Button(action_frame, text="Export Report", command=self.export_report).pack(side='left', padx=6)
+
+        # 輸出區
+        output_frame = ttk.LabelFrame(frame, text="Output")
+        output_frame.pack(fill='both', expand=True, padx=4, pady=4)
+        self.text_out = tk.Text(output_frame)
+        self.text_out.pack(fill='both', expand=True)
+
+    def show_topk_ngrams(self):
+        if not hasattr(self, 'top_ngrams_info') or not self.top_ngrams_info:
+            messagebox.showwarning("No data", "Please run analysis first.")
+            return
+        k = max(1, int(self.topk_ngram_var.get()))
+        self.text_out.delete('1.0', 'end')
+        self.text_out.insert('end', f"Top-{k} N-grams:\n\n")
+        for i, info in enumerate(self.top_ngrams_info[:k], start=1):
+            self.text_out.insert('end', f"{i}. {info['ngram']} (freq={info['freq']})\n")
+            self.text_out.insert('end', '\n')
+
+    # ------------------- 文件操作 -------------------
+    def add_files(self):
+        paths = filedialog.askopenfilenames(title="Select files", filetypes=[("Documents", "*.txt *.docx *.pdf")])
+        for p in paths:
+            if p not in self.filepaths:
+                self.filepaths.append(p)
+                self.files_listbox.insert('end', os.path.basename(p))
+
+    def clear_files(self):
+        self.filepaths = []
+        self.files_listbox.delete(0, 'end')
+
+    # ------------------- 分析 -------------------
+    def run_analysis_thread(self):
+        t = threading.Thread(target=self.run_analysis)
+        t.start()
+
+    def run_analysis(self):
+        try:
+            if not self.filepaths:
+                messagebox.showwarning("No files", "Please add files.")
+                return
+
+            n = max(1, int(self.n_var.get()))
+            self.doc_texts = [extract_text_from_file(p) for p in self.filepaths]
+            self.doc_names = [os.path.basename(p) for p in self.filepaths]
+
+            if not any(self.doc_texts):
+                messagebox.showwarning("Empty files", "No text extracted from selected files.")
+                return
+
+            sim, feat, vectors, vectorizer = compute_similarity(self.filepaths, n)
+            self.sim_matrix = sim
+            self.feature_names = feat
+            self.doc_vectors = vectors
+
+            # 矩陣圖保存位置選擇
+            heatmap_path = filedialog.asksaveasfilename(
+                title="Save heatmap image",
+                defaultextension='.png',
+                filetypes=[('PNG Image', '*.png')],
+                initialfile='ngram_heatmap.png'
+            )
+            # 如果用户未选择，默认保存到桌面
+            if not heatmap_path:
+                try:
+                    desktop = os.path.join(os.path.expanduser("~"), 'Desktop')
+                except Exception:
+                    desktop = os.path.expanduser("~")
+                heatmap_path = os.path.join(desktop, 'ngram_heatmap.png')
+            # 用戶自定義標題
+            heatmap_title = self.heatmap_title_var.get().strip()
+            plot_heatmap(sim, self.doc_names, heatmap_path, title=heatmap_title)
+            self.heatmap_path = heatmap_path
+
+            # Top-ngrams 計算
+            total_counts = np.sum(self.doc_vectors, axis=0)
+            top_idx = np.argsort(total_counts)[::-1][:50]
+            self.top_ngrams_info = []
+            for idx in top_idx:
+                ngram = self.feature_names[idx]
+                freq = int(total_counts[idx])
+                examples = defaultdict(list)
+                for name, text, vec in zip(self.doc_names, self.doc_texts, self.doc_vectors):
+                    sents = [s.strip() for s in text.split('。') if s.strip()]
+                    found = [s for s in sents if ngram in s]
+                    if found:
+                        examples[name] = found[:3]
+                doc_vals = {name: int(vec[idx]) for name, vec in zip(self.doc_names, self.doc_vectors)}
+                self.top_ngrams_info.append({'ngram': ngram, 'freq': freq, 'examples': examples, 'doc_vector_values': doc_vals})
+
+            self.show_topk_ngrams()
+        except Exception as e:
+            messagebox.showerror("Error", f"Analysis failed: {e}")
+
+
+
+    # ------------------- CSV / 報告 -------------------
+    def export_csv(self):
+        if not hasattr(self, 'sim_matrix'):
+            messagebox.showwarning("No data", "Please run analysis first.")
+            return
+        df = pd.DataFrame(self.sim_matrix, index=[os.path.splitext(n)[0] for n in self.doc_names],
+                          columns=[os.path.splitext(n)[0] for n in self.doc_names])
+        save_path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV file', '*.csv')])
+        if save_path:
+            df.to_csv(save_path, encoding='utf-8-sig')
+            messagebox.showinfo("Saved", f"CSV saved to {save_path}")
+
+    def export_report(self):
+        if not hasattr(self, 'top_ngrams_info'):
+            messagebox.showwarning("No data", "Please run analysis first.")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension='.docx', filetypes=[('Word file', '*.docx')])
+        if save_path:
+            generate_report(save_path, self.doc_names, self.feature_names, self.doc_vectors,
+                            self.sim_matrix, self.top_ngrams_info, self.heatmap_path,
+                            self.doc_texts, self.filepaths)
+            messagebox.showinfo("Saved", f"Report saved to {save_path}")
+
+# ------------------- 運行 -------------------
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = NgramApp(root)
+    root.mainloop()
