@@ -1,0 +1,102 @@
+import os
+import numpy as np
+import pandas as pd
+from docx import Document as DocxReader
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# ------------------- 文本處理 -------------------
+# 提取不同类型文件的文本内容
+def extract_text_from_file(file_path):
+    """
+    根据文件类型（仅支持.docx）读取文本内容。
+    - docx: 用python-docx读取段落并合并
+    - 其他: 返回空字符串
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == '.docx':
+            from docx import Document
+            doc = Document(file_path)
+            return '\n'.join([para.text for para in doc.paragraphs])
+        else:
+            return ""
+    except Exception as e:
+        return ""
+
+
+# ----------- Word文檔token提取與n-gram生成 -----------
+
+def extract_paragraph_tokens(file_path):
+    """
+    提取Word文档每个段落的token列表。
+    - 每个段落为一个token序列（列表）。
+    返回：List[List[str]]，每个元素为该段落的token列表。
+    """
+    doc = DocxReader(file_path)
+    all_paragraph_tokens = []
+    for para in doc.paragraphs:
+        tokens = []
+        for run in para.runs:
+            tokens.extend([ch for ch in run.text])
+        all_paragraph_tokens.append(tokens)
+    return all_paragraph_tokens
+
+def generate_paragraph_ngrams(file_path, n):
+    """
+    基于extract_paragraph_tokens，生成段落内滑动的n-gram tokens。
+    - 返回所有段落的n-gram合并后的列表。
+    - 实体token直接参与合并（不含中括号），非实体为单字。
+    """
+    para_tokens_list = extract_paragraph_tokens(file_path)
+    ngram_tokens = []
+    for tokens in para_tokens_list:
+        if len(tokens) < n:
+            continue
+        ngrams = [''.join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+        ngram_tokens.extend(ngrams)
+    return ngram_tokens
+
+
+# ------------------- 相似度計算 -------------------
+def compute_similarity(file_paths, n):
+    # 使用 generate_paragraph_ngrams 提取 ngram tokens
+    all_ngram_tokens = [generate_paragraph_ngrams(p, n) for p in file_paths]
+    texts_for_vectorizer = [' '.join(tokens) for tokens in all_ngram_tokens]
+    vectorizer = CountVectorizer(tokenizer=lambda x: x.split(), lowercase=False)
+    X = vectorizer.fit_transform(texts_for_vectorizer)
+    feature_names = vectorizer.get_feature_names_out()
+    doc_vectors = X.toarray()
+    sim = cosine_similarity(doc_vectors)
+    return sim, feature_names, doc_vectors, vectorizer
+
+# ------------------- 命令行主程序 -------------------
+def main():
+    import os
+    # 示例文件路径，假设保存在桌面
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    file_paths = [
+        os.path.join(desktop, "文本1.docx"),
+        os.path.join(desktop, "文本2.docx")
+    ]
+
+    for file_path in file_paths:
+        if not os.path.isfile(file_path):
+            print(f"File not found: {file_path}")
+            return
+
+    n = 3  # 默认 n-gram
+    output_file = "相似度矩陣.csv"
+    sim, feature_names, doc_vectors, vectorizer = compute_similarity(file_paths, n)
+    base_names = [os.path.splitext(os.path.basename(p))[0] for p in file_paths]
+    df = pd.DataFrame(sim, index=base_names, columns=base_names)
+    print("\n=== 文本相似度矩陣 ===")
+    print(df)
+    desktop_path = os.path.join(desktop, output_file)
+    df.to_csv(desktop_path, encoding='utf-8-sig')
+    print(f"Similarity matrix saved to {desktop_path}")
+
+
+if __name__ == '__main__':
+    main()
